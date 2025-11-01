@@ -8,6 +8,7 @@ from typing import Dict, Any, List
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from PIL import Image, ImageDraw
 
 
@@ -186,6 +187,56 @@ def json_to_rooms(json_data: Dict[str, Any]):
 # =========================================================
 # DRAW OVERLAY (polygon-aware)
 # =========================================================
+def bbox_to_polygon(bbox: Dict[str, Any]) -> List[List[float]]:
+    x = float(bbox.get("x", 0))
+    y = float(bbox.get("y", 0))
+    w = float(bbox.get("width", 0))
+    h = float(bbox.get("height", 0))
+    return [
+        [x, y],
+        [x + w, y],
+        [x + w, y + h],
+        [x, y + h],
+    ]
+
+
+def polygon_to_bbox(polygon: List[List[float]]) -> Dict[str, float]:
+    xs = [p[0] for p in polygon]
+    ys = [p[1] for p in polygon]
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
+    return {
+        "x": float(min_x),
+        "y": float(min_y),
+        "width": float(max_x - min_x),
+        "height": float(max_y - min_y),
+    }
+
+
+def sync_page_rooms():
+    if not st.session_state.get("page_meta") or st.session_state.get("rooms_df") is None:
+        return
+
+    rooms = []
+    df = st.session_state.rooms_df
+    for _, row in df.iterrows():
+        rid = row["room_id"]
+        raw = dict(st.session_state.room_lookup.get(rid, {}))
+        raw.setdefault("room_id", rid)
+        raw.setdefault("room_name", row.get("room_name", rid))
+        dept_val = row.get("department")
+        if isinstance(dept_val, str) and dept_val.strip():
+            raw["department"] = dept_val.strip()
+        polygon = raw.get("polygon")
+        if polygon:
+            raw["polygon"] = [[float(p[0]), float(p[1])] for p in polygon]
+            if not raw.get("bbox"):
+                raw["bbox"] = polygon_to_bbox(raw["polygon"])
+        rooms.append(raw)
+
+    st.session_state.page_meta["rooms"] = rooms
+
+
 def draw_overlay(
     base_img: Image.Image,
     rooms_df: pd.DataFrame,
@@ -211,9 +262,8 @@ def draw_overlay(
         if polygon:
             pts = [(int(p[0]), int(p[1])) for p in polygon]
             is_selected = rid in highlight_ids
-            fill = (255, 0, 0, 64) if is_selected else (0, 128, 255, 40)
             outline = (255, 0, 0, 255) if is_selected else (0, 128, 255, 200)
-            draw.polygon(pts, fill=fill, outline=outline)
+            draw.line(pts + [pts[0]], fill=outline, width=4 if is_selected else 2)
             # label near first point
             if pts:
                 draw.text((pts[0][0] + 4, pts[0][1] + 4), room_name[:22], fill=(0, 0, 0, 255))
@@ -236,12 +286,161 @@ def draw_overlay(
             w = int(bbox.get("width", 50))
             h = int(bbox.get("height", 50))
             is_selected = rid in highlight_ids
-            fill = (255, 0, 0, 64) if is_selected else (0, 128, 255, 30)
             outline = (255, 0, 0, 255) if is_selected else (0, 128, 255, 160)
-            draw.rectangle([x, y, x + w, y + h], fill=fill, outline=outline, width=3 if is_selected else 1)
+            draw.rectangle([x, y, x + w, y + h], outline=outline, width=4 if is_selected else 2)
             draw.text((x + 4, y + 4), room_name[:22], fill=(0, 0, 0, 255))
 
     return img
+
+
+def render_polygon_canvas(
+    image_b64: str,
+    polygon: List[List[float]],
+    canvas_key: str,
+    width: int,
+    height: int,
+):
+    image_src = f"data:image/png;base64,{image_b64}"
+    polygon = polygon or []
+    html = f"""
+    <div class=\"polygon-editor\">
+      <style>
+        .polygon-editor {{
+            width: 100%;
+        }}
+        .polygon-toolbar {{
+            margin-bottom: 0.5rem;
+        }}
+        .polygon-toolbar button {{
+            margin-right: 0.5rem;
+        }}
+      </style>
+      <div class=\"polygon-toolbar\">
+        <button id=\"add-corner-{canvas_key}\">Add corner</button>
+        <button id=\"remove-corner-{canvas_key}\">Remove corner</button>
+        <span>Drag the red handles to move room corners.</span>
+      </div>
+      <canvas id=\"editor-canvas-{canvas_key}\" width=\"{width}\" height=\"{height}\"></canvas>
+    </div>
+    <script src=\"https://cdnjs.cloudflare.com/ajax/libs/fabric.js/5.2.4/fabric.min.js\"></script>
+    <script>
+    const Streamlit = (window.parent && window.parent.Streamlit) ? window.parent.Streamlit : window.Streamlit;
+    if (Streamlit && Streamlit.setComponentReady) {{
+        Streamlit.setComponentReady();
+    }}
+    const imageSrc = {json.dumps(image_src)};
+    const initialPoints = {json.dumps(polygon)};
+    const handleRadius = 8;
+    let canvas, polygonObject, handles = [];
+
+    function sendUpdate() {{
+        if (!Streamlit || !polygonObject) return;
+        const pts = polygonObject.points.map(pt => [Math.round(pt.x), Math.round(pt.y)]);
+        if (Streamlit && Streamlit.setComponentValue) {{
+            Streamlit.setComponentValue(pts);
+        }}
+        if (Streamlit && Streamlit.setFrameHeight) {{
+            Streamlit.setFrameHeight({height} + 120);
+        }}
+    }}
+
+    function clearHandles() {{
+        handles.forEach(h => canvas.remove(h));
+        handles = [];
+    }}
+
+    function addHandle(idx) {{
+        const pt = polygonObject.points[idx];
+        const circle = new fabric.Circle({{
+            left: pt.x - handleRadius,
+            top: pt.y - handleRadius,
+            radius: handleRadius,
+            fill: '#ff0000',
+            stroke: '#ffffff',
+            strokeWidth: 2,
+            hasBorders: false,
+            hasControls: false,
+            hoverCursor: 'move',
+            name: 'handle_' + idx
+        }});
+        circle.on('moving', () => {{
+            const cx = circle.left + handleRadius;
+            const cy = circle.top + handleRadius;
+            polygonObject.points[idx].x = cx;
+            polygonObject.points[idx].y = cy;
+            polygonObject.dirty = true;
+            canvas.renderAll();
+            sendUpdate();
+        }});
+        handles.push(circle);
+        canvas.add(circle);
+    }}
+
+    function rebuildHandles() {{
+        clearHandles();
+        polygonObject.points.forEach((_, idx) => addHandle(idx));
+        canvas.renderAll();
+        sendUpdate();
+    }}
+
+    function buildPolygon(points) {{
+        let pts = points && points.length ? points.map(p => [p[0], p[1]]) : [];
+        if (pts.length === 0) {{
+            pts = [
+                [Math.round({width} * 0.3), Math.round({height} * 0.3)],
+                [Math.round({width} * 0.5), Math.round({height} * 0.3)],
+                [Math.round({width} * 0.5), Math.round({height} * 0.5)],
+                [Math.round({width} * 0.3), Math.round({height} * 0.5)]
+            ];
+        }}
+        polygonObject = new fabric.Polygon(pts.map(p => {{ return {{ x: p[0], y: p[1] }}; }}), {{
+            fill: '',
+            stroke: '#ff0000',
+            strokeWidth: 2,
+            selectable: false,
+            evented: false,
+            objectCaching: false
+        }});
+        canvas.add(polygonObject);
+        rebuildHandles();
+    }}
+
+    function initEditor() {{
+        canvas = new fabric.Canvas('editor-canvas-{canvas_key}', {{ selection: false }});
+        fabric.Image.fromURL(imageSrc, function(img) {{
+            canvas.setWidth(img.width);
+            canvas.setHeight(img.height);
+            canvas.setBackgroundImage(img, canvas.renderAll.bind(canvas));
+            buildPolygon(initialPoints);
+            sendUpdate();
+        }});
+    }}
+
+    document.getElementById('add-corner-{canvas_key}').addEventListener('click', () => {{
+        if (!polygonObject) return;
+        const cx = canvas.getWidth() / 2;
+        const cy = canvas.getHeight() / 2;
+        polygonObject.points.push({{ x: cx, y: cy }});
+        polygonObject.dirty = true;
+        rebuildHandles();
+    }});
+
+    document.getElementById('remove-corner-{canvas_key}').addEventListener('click', () => {{
+        if (!polygonObject) return;
+        if (polygonObject.points.length <= 3) return;
+        polygonObject.points.pop();
+        polygonObject.dirty = true;
+        rebuildHandles();
+    }});
+
+    if (document.readyState === 'loading') {{
+        document.addEventListener('DOMContentLoaded', initEditor);
+    }} else {{
+        initEditor();
+    }}
+    </script>
+    """
+    return components.html(html, height=height + 160, key=f"canvas_{canvas_key}")
 
 
 # =========================================================
@@ -264,6 +463,10 @@ def main():
         st.session_state.selected_rooms = []
     if "current_filename" not in st.session_state:
         st.session_state.current_filename = ""
+    if "image_b64" not in st.session_state:
+        st.session_state.image_b64 = None
+    if "latest_canvas_points" not in st.session_state:
+        st.session_state.latest_canvas_points = {}
 
     # ---- sidebar upload ----
     st.sidebar.header("1. Load floorplan JSON")
@@ -277,6 +480,9 @@ def main():
         st.session_state.room_lookup = lookup
         st.session_state.page_meta = page_meta
         st.session_state.current_filename = uploaded.name
+        st.session_state.image_b64 = page_meta.get("image_b64")
+        st.session_state.latest_canvas_points = {}
+        sync_page_rooms()
         st.success(f"Loaded {uploaded.name} with {len(df)} rooms")
 
     col_canvas, col_controls = st.columns([2, 1])
@@ -298,6 +504,59 @@ def main():
                 st.image(overlay_img, caption="Floorplan with overlay", use_container_width=True)
             except TypeError:
                 st.image(overlay_img, caption="Floorplan with overlay", use_column_width=True)
+
+            st.markdown("#### Interactive room boundary editor")
+            room_ids = st.session_state.rooms_df["room_id"].tolist()
+            if room_ids:
+                edit_choice = st.selectbox("Choose a room to adjust", ["--"] + room_ids, key="interactive_room_select")
+                if edit_choice != "--":
+                    raw_shape = st.session_state.room_lookup.get(edit_choice, {}).copy()
+                    polygon = raw_shape.get("polygon")
+                    if not polygon:
+                        bbox = raw_shape.get("bbox")
+                        if isinstance(bbox, str):
+                            try:
+                                bbox = json.loads(bbox)
+                            except Exception:
+                                bbox = None
+                        if bbox:
+                            polygon = bbox_to_polygon(bbox)
+                    if polygon is None:
+                        polygon = []
+
+                    if st.session_state.image_b64:
+                        canvas_key = f"room_{abs(hash(edit_choice))}"
+                        result = render_polygon_canvas(
+                            st.session_state.image_b64,
+                            polygon,
+                            canvas_key=canvas_key,
+                            width=st.session_state.base_image.width,
+                            height=st.session_state.base_image.height,
+                        )
+                        if result is not None:
+                            parsed = result
+                            if isinstance(result, str):
+                                try:
+                                    parsed = json.loads(result)
+                                except Exception:
+                                    parsed = None
+                            if parsed:
+                                st.session_state.latest_canvas_points[edit_choice] = parsed
+
+                        if st.button("Apply shape changes", key=f"apply_{edit_choice}"):
+                            updated_pts = st.session_state.latest_canvas_points.get(edit_choice)
+                            if updated_pts:
+                                polygon_pts = [[float(p[0]), float(p[1])] for p in updated_pts]
+                                raw_shape["polygon"] = polygon_pts
+                                raw_shape["bbox"] = polygon_to_bbox(polygon_pts)
+                                raw_shape["room_id"] = edit_choice
+                                st.session_state.room_lookup[edit_choice] = raw_shape
+                                mask = st.session_state.rooms_df["room_id"] == edit_choice
+                                st.session_state.rooms_df.loc[mask, "bbox"] = json.dumps(raw_shape["bbox"])
+                                sync_page_rooms()
+                                st.success("Updated room geometry.")
+                            else:
+                                st.warning("Move the handles before applying to capture new points.")
         else:
             st.info("Upload a JSON to see the floorplan.")
 
@@ -333,6 +592,7 @@ def main():
                     mask = updated["room_id"].isin(ms_ids)
                     updated.loc[mask, "department"] = dept_name.strip()
                     st.session_state.rooms_df = updated
+                    sync_page_rooms()
                     st.success(f"Assigned {len(ms_ids)} rooms to '{dept_name.strip()}'")
 
             st.markdown("---")
@@ -349,6 +609,65 @@ def main():
                     lookup=st.session_state.room_lookup,
                 )
                 st.success(f"Saved floorplan to DB with id={fid}")
+
+            st.markdown("---")
+            st.markdown("### Add a new room")
+            with st.form("add_room_form"):
+                new_room_id = st.text_input("Room ID", key="new_room_id")
+                new_room_name = st.text_input("Room name", key="new_room_name")
+                submitted_new = st.form_submit_button("Create room for editing")
+                if submitted_new:
+                    if not new_room_id.strip():
+                        st.warning("Room ID is required.")
+                    elif new_room_id in st.session_state.room_lookup:
+                        st.warning("Room ID already exists.")
+                    else:
+                        name_value = new_room_name.strip() if new_room_name else new_room_id.strip()
+                        width, height = st.session_state.base_image.size
+                        default_poly = [
+                            [float(width * 0.35), float(height * 0.35)],
+                            [float(width * 0.55), float(height * 0.35)],
+                            [float(width * 0.55), float(height * 0.55)],
+                            [float(width * 0.35), float(height * 0.55)],
+                        ]
+                        bbox = polygon_to_bbox(default_poly)
+                        st.session_state.room_lookup[new_room_id] = {
+                            "room_id": new_room_id,
+                            "room_name": name_value,
+                            "polygon": default_poly,
+                            "bbox": bbox,
+                        }
+                        new_row = pd.DataFrame(
+                            [
+                                {
+                                    "room_id": new_room_id,
+                                    "room_name": name_value,
+                                    "department": "",
+                                    "bbox": json.dumps(bbox),
+                                }
+                            ]
+                        )
+                        st.session_state.rooms_df = pd.concat(
+                            [st.session_state.rooms_df, new_row], ignore_index=True
+                        )
+                        sync_page_rooms()
+                        st.success("New room created. Use the editor to adjust its shape.")
+
+            st.markdown("---")
+            if st.session_state.page_meta and st.session_state.image_b64:
+                sync_page_rooms()
+                json_payload = {
+                    "pages": {
+                        "0": {**st.session_state.page_meta, "rooms": st.session_state.page_meta.get("rooms", [])}
+                    }
+                }
+                filename = (st.session_state.current_filename or "floorplan.json").replace(".json", "")
+                st.download_button(
+                    "💾 Save JSON",
+                    data=json.dumps(json_payload, indent=2),
+                    file_name=f"{filename}_edited.json",
+                    mime="application/json",
+                )
 
     # =====================================================
     # POLYGON EDITOR (bottom)
@@ -378,6 +697,12 @@ def main():
                     current_raw["polygon"] = new_poly
                     # leave other fields intact (bbox etc)
                     st.session_state.room_lookup[edit_room_id] = current_raw
+                    if new_poly:
+                        bbox = polygon_to_bbox(new_poly)
+                        st.session_state.room_lookup[edit_room_id]["bbox"] = bbox
+                        mask = st.session_state.rooms_df["room_id"] == edit_room_id
+                        st.session_state.rooms_df.loc[mask, "bbox"] = json.dumps(bbox)
+                    sync_page_rooms()
                     st.success("Polygon updated. Scroll up to see overlay.")
                 except Exception as e:
                     st.error(f"Invalid JSON: {e}")
