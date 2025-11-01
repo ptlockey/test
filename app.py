@@ -300,6 +300,34 @@ def render_polygon_canvas(
     width: int,
     height: int,
 ):
+    """Render the editable polygon canvas component.
+
+    Streamlit's ``components.html`` is strict about the type of the ``height``
+    argument – it must be a plain ``int``.  When we decode floor plan images,
+    ``Pillow`` exposes ``width``/``height`` as ``int`` values, but depending on
+    the source JSON (or how Streamlit deserialises the session), these fields
+    can occasionally arrive as ``float``/``Decimal``/``numpy`` scalar types.
+    Adding 160 pixels of padding to a ``numpy`` scalar, for example, raises the
+    ``TypeError`` observed by users when selecting a room to adjust.  To keep
+    the editor robust we coerce both dimensions to integers before using them
+    in HTML attributes or Streamlit component arguments.
+    """
+
+    try:
+        canvas_width = int(width)
+    except (TypeError, ValueError):
+        canvas_width = 0
+    try:
+        canvas_height = int(height)
+    except (TypeError, ValueError):
+        canvas_height = 0
+
+    # ``components.html`` requires a strictly positive height, so default to a
+    # minimal canvas if the conversion above failed.
+    if canvas_width <= 0 or canvas_height <= 0:
+        canvas_width = max(canvas_width, 300)
+        canvas_height = max(canvas_height, 300)
+
     image_src = f"data:image/png;base64,{image_b64}"
     polygon = polygon or []
     html = f"""
@@ -320,7 +348,7 @@ def render_polygon_canvas(
         <button id=\"remove-corner-{canvas_key}\">Remove corner</button>
         <span>Drag the red handles to move room corners.</span>
       </div>
-      <canvas id=\"editor-canvas-{canvas_key}\" width=\"{width}\" height=\"{height}\"></canvas>
+      <canvas id=\"editor-canvas-{canvas_key}\" width=\"{canvas_width}\" height=\"{canvas_height}\"></canvas>
     </div>
     <script src=\"https://cdnjs.cloudflare.com/ajax/libs/fabric.js/5.2.4/fabric.min.js\"></script>
     <script>
@@ -440,7 +468,11 @@ def render_polygon_canvas(
     }}
     </script>
     """
-    return components.html(html, height=height + 160, key=f"canvas_{canvas_key}")
+    return components.html(
+        html,
+        height=canvas_height + 160,
+        key=f"canvas_{canvas_key}",
+    )
 
 
 # =========================================================
